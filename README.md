@@ -108,7 +108,8 @@ const muros = ['IMBITUB', 'TCG', 'TEG', 'TECON', 'SEU_TERMINAL'];
 
 * **Licença:** MIT License — Livre para modificação e uso comercial.
 * **Desenvolvedor:** Zegmundo Koziel, 2026.
-* **Versão Atual:** v1.2.0
+* **Versão Atual:** v1.2.1
+  
 
 
 
