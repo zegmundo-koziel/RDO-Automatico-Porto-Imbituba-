@@ -1,61 +1,85 @@
+/**
+ * RDO Automático - Monitor de Cargas Portuárias
+ * CONFIGURAÇÃO: Preencha os 3 valores abaixo antes de usar
+ */
+const CONFIG = {
+  ID_PLANILHA: "COLE_AQUI_ID_DA_PLANILHA",
+  URL_PDF: "https://www.portodeimbituba.com.br/downloads/rdo.pdf",
+  PASTA_PDF_ID: "COLE_AQUI_ID_DA_PASTA_RDO_PDF",
+  NOME_PORTO: "Imbituba" // Troque pelo nome do porto
+};
+
 function executarRDOAutomatico() {
   let arquivoPdf = null;
+  let tempFileId = null;
+  let docFileId = null;
+
   try {
-    const ID_PLANILHA = "COLE AQUI O ID DA PLANILHA";
-    const URL_PDF = "https://www.portodeimbituba.com.br/downloads/rdo.pdf";
-    const PASTA_PDF_ID = "COLE AQUI O ID DA PASTA RDO_PDF_HISTORICO";
+    validarConfig();
 
-    const pdfResponse = UrlFetchApp.fetch(URL_PDF, { muteHttpExceptions: true });
+    const pdfResponse = UrlFetchApp.fetch(CONFIG.URL_PDF, { muteHttpExceptions: true });
     if (pdfResponse.getResponseCode()!== 200) {
-      throw new Error("Não consegui baixar o PDF. Código: " + pdfResponse.getResponseCode());
+      throw new Error(`Falha ao baixar PDF. Código: ${pdfResponse.getResponseCode()}`);
     }
-    const pdfBlob = pdfResponse.getBlob().setName('RDO_Imbituba.pdf');
+    const pdfBlob = pdfResponse.getBlob().setName(`RDO_${CONFIG.NOME_PORTO}.pdf`);
 
-    const pasta = DriveApp.getFolderById(PASTA_PDF_ID);
+    const pasta = DriveApp.getFolderById(CONFIG.PASTA_PDF_ID);
     const dataHoje = Utilities.formatDate(new Date(), 'GMT-3', 'dd/MM/yyyy');
     arquivoPdf = pasta.createFile(pdfBlob);
-    arquivoPdf.setName('RDO_Imbituba_' + dataHoje.replace(/\//g, '-') + '.pdf');
+    arquivoPdf.setName(`RDO_${CONFIG.NOME_PORTO}_${dataHoje.replace(/\//g, '-')}.pdf`);
 
-    const textoPdf = extrairTextoDoPDF(pdfBlob);
-    console.log("--- INICIO PDF ---");
-    console.log(textoPdf);
-    console.log("--- FIM PDF ---");
+    const resultado = extrairTextoDoPDF(pdfBlob);
+    tempFileId = resultado.tempId;
+    docFileId = resultado.docId;
+    const textoPdf = resultado.texto;
 
-    const dados = processarRDO(textoPdf, ID_PLANILHA);
-    enviarEmailRDO(dados, pdfBlob, ID_PLANILHA, dataHoje);
+    Logger.log(`PDF processado. ${textoPdf.length} caracteres extraídos.`);
+
+    if (textoPdf.length < 100) {
+      throw new Error("PDF parece vazio ou corrompido. Texto extraído muito curto.");
+    }
+
+    const dados = processarRDO(textoPdf, CONFIG.ID_PLANILHA);
+    enviarEmailRDO(dados, pdfBlob, CONFIG.ID_PLANILHA, dataHoje);
 
   } catch (erro) {
     console.error("Erro no automático: " + erro.message);
     Logger.log("ERRO: " + erro.message + "\n" + erro.stack);
-    // DESCOMENTA SÓ DEPOIS QUE VALIDAR QUE TÁ TUDO OK PRA NÃO GASTAR COTA
-    // MailApp.sendEmail({
-    // to: Session.getActiveUser().getEmail(),
-    // subject: "ERRO RDO Automático Imbituba",
-    // body: "Falha ao rodar: " + erro.message + "\n\n" + erro.stack
-    // });
+    notificarErro(erro);
   } finally {
-    if (arquivoPdf) {
-      try {
-        arquivoPdf.setTrashed(true);
-        Logger.log("PDF movido pra lixeira: " + arquivoPdf.getName());
-      } catch (e) {
-        Logger.log("Falha ao apagar PDF: " + e.message);
-      }
-    }
+    // Limpa tudo mesmo se der erro
+    if (arquivoPdf) try { arquivoPdf.setTrashed(true); } catch(e) {}
+    if (tempFileId) try { DriveApp.getFileById(tempFileId).setTrashed(true); } catch(e) {}
+    if (docFileId) try { DriveApp.getFileById(docFileId).setTrashed(true); } catch(e) {}
+  }
+}
+
+function validarConfig() {
+  if (CONFIG.ID_PLANILHA.includes("COLE_AQUI") || CONFIG.PASTA_PDF_ID.includes("COLE_AQUI")) {
+    throw new Error("CONFIG não preenchida. Edite o objeto CONFIG no topo do código com os IDs reais.");
   }
 }
 
 function extrairTextoDoPDF(pdfBlob) {
+  // ATENÇÃO: Ativar Drive API em Serviços Avançados > Drive API
   const tempFile = DriveApp.createFile(pdfBlob);
-  const resource = {
-    title: tempFile.getName(),
-    mimeType: 'application/vnd.google-apps.document'
-  };
-  const docFile = Drive.Files.copy(resource, tempFile.getId(), {convert: true});
-  const texto = DocumentApp.openById(docFile.id).getBody().getText();
-  Drive.Files.remove(docFile.id);
-  Drive.Files.remove(tempFile.getId());
-  return texto;
+  const tempFileId = tempFile.getId();
+
+  try {
+    const resource = {
+      title: tempFile.getName(),
+      mimeType: MimeType.GOOGLE_DOCS
+    };
+
+    const docFile = Drive.Files.copy(resource, tempFileId, {convert: true});
+    const docFileId = docFile.id;
+    const texto = DocumentApp.openById(docFileId).getBody().getText();
+
+    return { texto, tempId: tempFileId, docId: docFileId };
+  } catch (e) {
+    try { DriveApp.getFileById(tempFileId).setTrashed(true); } catch(e2) {}
+    throw new Error("Falha ao converter PDF. Ative Drive API em Serviços Avançados: " + e.message);
+  }
 }
 
 function escapeRegex(string) {
@@ -65,26 +89,28 @@ function escapeRegex(string) {
 function processarRDO(textoPdf, idPlanilha) {
   const planilha = SpreadsheetApp.openById(idPlanilha);
   const abaCargas = planilha.getSheetByName("cargas");
-  if (!abaCargas) throw new Error("Aba 'cargas' não encontrada na planilha.");
+  if (!abaCargas) throw new Error("Aba 'cargas' não encontrada. Crie uma aba chamada exatamente 'cargas'.");
 
   const ultimaLinha = abaCargas.getLastRow();
   let listaCargas = [];
   if (ultimaLinha >= 2) {
     listaCargas = abaCargas.getRange("A2:A" + ultimaLinha).getValues()
-.map(r => r.toString().trim()).filter(v => v!== "");
+     .map(r => r.toString().trim())
+     .filter(v => v!== "");
   }
+
   if (listaCargas.length === 0) {
-    Logger.log("AVISO: Nenhuma carga cadastrada na planilha");
+    Logger.log("AVISO: Nenhuma carga cadastrada na aba 'cargas'");
     return { status: "sem_carga", cargas: [], tabela: [] };
   }
 
   let cargasOrdenadas = [...listaCargas].sort((a,b) => b.length - a.length);
-  let cargasEncontradas = [];
+  let cargasEncontradas = new Set();
   let tabelaNavios = [];
 
   const secoes = [
-    { nome: "NAVIO ESPERADO", regex: /NAVIOS ESPERADOS([\s\S]*?)(?=NAVIOS ATRACADOS|NAVIOS SAÍDOS|Emitido em|$)/i },
-    { nome: "NAVIO ATRACADO", regex: /NAVIOS ATRACADOS([\s\S]*?)(?=NAVIOS SAÍDOS|Emitido em|$)/i }
+    { nome: "NAVIO ESPERADO", regex: /NAVIOS?\s+ESPERADOS?([\s\S]*?)(?=NAVIOS?\s+ATRACADOS?|NAVIOS?\s+SA[IÍ]DOS?|Emitido\s+em|$)/i },
+    { nome: "NAVIO ATRACADO", regex: /NAVIOS?\s+ATRACADOS?([\s\S]*?)(?=NAVIOS?\s+SA[IÍ]DOS?|Emitido\s+em|$)/i }
   ];
 
   for (let secao of secoes) {
@@ -92,155 +118,81 @@ function processarRDO(textoPdf, idPlanilha) {
     if (!matchSecao) continue;
 
     let textoSecao = matchSecao[1];
+    textoSecao = textoSecao.replace(/NAVIO\s+VG\s+LOA[\s\S]*?PREVISTO/i, '').trim();
 
-    if (secao.nome === "NAVIO ESPERADO") {
-      textoSecao = textoSecao.replace(/NAVIO\s+VG\s+LOA[\s\S]*?PREVISTO/i, '').trim();
-      const regexNavio = /([A-Z][A-Z\s\.\-]+?)\s+(\d+)\s+([\d,]+)\s+(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}\s+(\d{4})\s+(.+?)\s+([\d\.,]+)(?=\s+[A-Z][A-Z\s\.\-]+?\s+\d+|$)/g;
-      var matches = [...textoSecao.matchAll(regexNavio)];
+    const regexNavio = /([A-Z][A-Z\s\.\-]+?)\s+(\d+)\s+([\d,\.]+)\s+(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}\s+(\d{4})\s+(.+?)\s+([\d\.,]+)/g;
+    const matches = [...textoSecao.matchAll(regexNavio)];
 
-      for (let match of matches) {
-        let nomeNavio = match[1].replace(/\s+\d+$/, '').trim();
-        let chegada = match[4];
-        let berco = match[5];
-        let miolo = match[6].trim();
-        let previsto = match[7];
+    for (let match of matches) {
+      let nomeNavio = match[1].replace(/\s+\d+$/, '').trim();
+      let data = match[4];
+      let berco = secao.nome === "NAVIO ATRACADO"? match[5] : "N/A";
+      let miolo = match[6].trim();
+      let tonelagem = match[7];
 
-        const muros = ['IMBITUB','IMBIT','TCG','GRANÉIS','GRANEIS','ILP','BRASI','CRISTAL'];
-        let partesMiolo = miolo.split(/\s+/);
-        let idxMuro = -1;
+      let cargaInfo = detectarCarga(miolo, cargasOrdenadas);
+      if (!cargaInfo) continue;
 
-        for (let i = partesMiolo.length - 1; i >= 0; i--) {
-          if (muros.some(m => partesMiolo[i].toUpperCase().includes(m))) {
-            idxMuro = i;
-            break;
-          }
-        }
+      cargasEncontradas.add(cargaInfo.carga);
 
-        if (idxMuro === -1) continue;
-
-        let depoisMuro = partesMiolo.slice(idxMuro + 1).join(" ");
-        let origemPorto = "";
-        let cargaCompleta = "";
-        let cargaDetectada = null;
-
-        let depoisMuroNormalizado = depoisMuro.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-
-        for (let carga of cargasOrdenadas) {
-          let cargaNormalizada = carga.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-          let idxCarga = depoisMuroNormalizado.indexOf(cargaNormalizada);
-          if (idxCarga!== -1) {
-            cargaDetectada = carga;
-
-            // NOVO: expande pra pegar a palavra inteira que contém a busca
-            let idxInicioPalavra = depoisMuro.lastIndexOf(' ', idxCarga);
-            idxInicioPalavra = idxInicioPalavra === -1? 0 : idxInicioPalavra + 1;
-
-            let idxFimPalavra = depoisMuro.indexOf(' ', idxCarga);
-            idxFimPalavra = idxFimPalavra === -1? depoisMuro.length : idxFimPalavra;
-
-            let palavraInteira = depoisMuro.substring(idxInicioPalavra, idxFimPalavra);
-
-            origemPorto = depoisMuro.substring(0, idxInicioPalavra).trim();
-            cargaCompleta = palavraInteira + depoisMuro.substring(idxFimPalavra);
-
-            if (!cargasEncontradas.includes(cargaDetectada)) cargasEncontradas.push(cargaDetectada);
-            break;
-          }
-        }
-
-        if (!cargaDetectada) continue;
-
-        tabelaNavios.push({
-          status: secao.nome,
-          navio: nomeNavio,
-          chegada: chegada,
-          berco: "N/A",
-          origem_porto: origemPorto,
-          carga_completa: cargaCompleta.trim(),
-          previsto: previsto,
-          carga_detectada: cargaDetectada
-        });
-      }
-
-    } else if (secao.nome === "NAVIO ATRACADO") {
-      textoSecao = textoSecao.replace(/NAVIO\s+VG\s+LOA[\s\S]*?PREVISTO/i, '').trim();
-      const regexAtracado = /([A-Z][A-Z\s\.\-]+?)\s+(\d+)\s+([\d,]+)\s+(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}\s+(\d{4})\s+(.+?)\s+\d{2}\/\d{2}\s+\d{2}:\d{2}\s+([\d\.,]+)\s+[\d\.,]+(?=\s+[A-Z][A-Z\s\.\-]+?\s+\d+|$)/g;
-      var matches = [...textoSecao.matchAll(regexAtracado)];
-
-      for (let match of matches) {
-        let nomeNavio = match[1].replace(/\s+\d+$/, '').trim();
-        let atracacao = match[4];
-        let berco = match[5];
-        let miolo = match[6].trim();
-        let realizado = match[7];
-
-        const muros = ['IMBITUB','IMBIT','TCG','GRANÉIS','GRANEIS','ILP','BRASI','CRISTAL'];
-        let partesMiolo = miolo.split(/\s+/);
-        let idxMuro = -1;
-
-        for (let i = partesMiolo.length - 1; i >= 0; i--) {
-          if (muros.some(m => partesMiolo[i].toUpperCase().includes(m))) {
-            idxMuro = i;
-            break;
-          }
-        }
-
-        if (idxMuro === -1) continue;
-
-        let depoisMuro = partesMiolo.slice(idxMuro + 1).join(" ");
-        let origemPorto = "";
-        let cargaCompleta = "";
-        let cargaDetectada = null;
-
-        let depoisMuroNormalizado = depoisMuro.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-
-        for (let carga of cargasOrdenadas) {
-          let cargaNormalizada = carga.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-          let idxCarga = depoisMuroNormalizado.indexOf(cargaNormalizada);
-          if (idxCarga!== -1) {
-            cargaDetectada = carga;
-
-            // NOVO: expande pra pegar a palavra inteira que contém a busca
-            let idxInicioPalavra = depoisMuro.lastIndexOf(' ', idxCarga);
-            idxInicioPalavra = idxInicioPalavra === -1? 0 : idxInicioPalavra + 1;
-
-            let idxFimPalavra = depoisMuro.indexOf(' ', idxCarga);
-            idxFimPalavra = idxFimPalavra === -1? depoisMuro.length : idxFimPalavra;
-
-            let palavraInteira = depoisMuro.substring(idxInicioPalavra, idxFimPalavra);
-
-            origemPorto = depoisMuro.substring(0, idxInicioPalavra).trim();
-            cargaCompleta = palavraInteira + depoisMuro.substring(idxFimPalavra);
-
-            if (!cargasEncontradas.includes(cargaDetectada)) cargasEncontradas.push(cargaDetectada);
-            break;
-          }
-        }
-
-        if (!cargaDetectada) continue;
-
-        tabelaNavios.push({
-          status: secao.nome,
-          navio: nomeNavio,
-          chegada: atracacao,
-          berco: berco,
-          origem_porto: origemPorto,
-          carga_completa: cargaCompleta.trim(),
-          previsto: realizado,
-          carga_detectada: cargaDetectada
-        });
-      }
+      tabelaNavios.push({
+        status: secao.nome,
+        navio: nomeNavio,
+        chegada: data,
+        berco: berco,
+        origem_porto: cargaInfo.origem,
+        carga_completa: cargaInfo.cargaCompleta,
+        previsto: tonelagem,
+        carga_detectada: cargaInfo.carga
+      });
     }
   }
 
-  Logger.log("CARGAS ENCONTRADAS: " + cargasEncontradas.join(", "));
-  Logger.log("TOTAL NAVIOS: " + tabelaNavios.length);
+  Logger.log(`CARGAS: ${[...cargasEncontradas].join(", ")} | NAVIOS: ${tabelaNavios.length}`);
 
   return {
-    status: cargasEncontradas.length > 0? "sucesso" : "sem_carga",
-    cargas: cargasEncontradas,
+    status: cargasEncontradas.size > 0? "sucesso" : "sem_carga",
+    cargas: [...cargasEncontradas],
     tabela: tabelaNavios
   };
+}
+
+function detectarCarga(textoMiolo, cargasOrdenadas) {
+  const muros = ['IMBITUB','IMBIT','TCG','GRANÉIS','GRANEIS','ILP','BRASI','CRISTAL','TEG','TECON'];
+  let partesMiolo = textoMiolo.split(/\s+/);
+  let idxMuro = -1;
+
+  for (let i = partesMiolo.length - 1; i >= 0; i--) {
+    if (muros.some(m => partesMiolo[i].toUpperCase().includes(m))) {
+      idxMuro = i;
+      break;
+    }
+  }
+
+  if (idxMuro === -1) return null;
+
+  let depoisMuro = partesMiolo.slice(idxMuro + 1).join(" ");
+  let depoisMuroNormalizado = depoisMuro.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+
+  for (let carga of cargasOrdenadas) {
+    let cargaNormalizada = carga.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    let idxCarga = depoisMuroNormalizado.indexOf(cargaNormalizada);
+
+    if (idxCarga!== -1) {
+      let idxInicio = depoisMuro.lastIndexOf(' ', idxCarga);
+      idxInicio = idxInicio === -1? 0 : idxInicio + 1;
+
+      let idxFim = depoisMuro.indexOf(' ', idxCarga + carga.length);
+      idxFim = idxFim === -1? depoisMuro.length : idxFim;
+
+      return {
+        carga: carga,
+        origem: depoisMuro.substring(0, idxInicio).trim(),
+        cargaCompleta: depoisMuro.substring(idxInicio, idxFim)
+      };
+    }
+  }
+  return null;
 }
 
 function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
@@ -252,59 +204,58 @@ function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
   let listaEmails = [];
   if (ultimaLinhaEmail >= 2) {
     listaEmails = abaEmails.getRange("B2:B" + ultimaLinhaEmail).getValues()
- .flat()
- .map(e => e.toString().trim())
- .filter(e => e!== "" && e.includes("@") && e.includes("."));
+     .flat()
+     .map(e => e.toString().trim())
+     .filter(e => e!== "" && e.includes("@"));
   }
 
   if (listaEmails.length === 0) {
-    Logger.log("Nenhum e-mail válido cadastrado na aba 'email'. Abortando envio.");
+    Logger.log("Nenhum e-mail válido cadastrado. Abortando envio.");
     return;
   }
 
   const temCarga = dados && dados.status === "sucesso" && dados.cargas.length > 0;
   const listaCargasAchadas = temCarga? dados.cargas.join(', ') : '';
 
-  let assunto = 'RDO Imbituba ' + dataHojeBR;
-  assunto += temCarga? ' - CARGA: ' + listaCargasAchadas : ' - SEM CARGA MONITORADA';
+  let assunto = `RDO ${CONFIG.NOME_PORTO} ${dataHojeBR}`;
+  assunto += temCarga? ` - CARGA: ${listaCargasAchadas}` : ' - SEM CARGA MONITORADA';
 
   let tabela = dados.tabela || [];
   let esperados = tabela.filter(r => r.status === "NAVIO ESPERADO");
   let atracados = tabela.filter(r => r.status === "NAVIO ATRACADO");
 
-  let corpoHtml = '<h3 style="margin: 0 0 8px 0; font-size: 16px;">Relatório de Navios e Cargas - Porto de Imbituba (' + dataHojeBR + ')</h3>';
+  let corpoHtml = `<h3 style="margin:0 0 8px 0;font-size:16px;">Relatório de Navios - ${CONFIG.NOME_PORTO} (${dataHojeBR})</h3>`;
 
   if (!temCarga) {
-    corpoHtml += '<p style="margin: 0 0 8px 0; font-size: 13px;"><b>Nenhuma carga monitorada encontrada no RDO de hoje.</b></p>';
+    corpoHtml += '<p style="margin:0 0 8px 0;font-size:13px;"><b>Nenhuma carga monitorada encontrada no RDO de hoje.</b></p>';
   } else {
-    corpoHtml += '<p style="margin: 0 0 8px 0; font-size: 13px;"><b>Cargas detectadas:</b> ' + listaCargasAchadas + '</p>';
+    corpoHtml += `<p style="margin:0 0 8px 0;font-size:13px;"><b>Cargas detectadas:</b> ${listaCargasAchadas}</p>`;
   }
 
   function gerarBlocoTabela(tituloSecao, listaNavios, ehAtracado) {
     if (listaNavios.length === 0) return '';
-    let html = '<table style="width: 100%; max-width: 900px; border-collapse: collapse; border: 1px solid #c0c0c0; font-family: Calibri, Arial, sans-serif; margin-bottom: 12px; font-size: 12px;">';
+    let html = `<table style="width:100%;max-width:900px;border-collapse:collapse;border:1px solid #c0c0c0;font-family:Calibri,Arial,sans-serif;margin-bottom:12px;font-size:12px;">`;
     let colSpanHeader = ehAtracado? "5" : "4";
-    html += '<tr style="background-color: #808080; color: #ffffff; font-weight: bold; text-align: center; font-size: 14px; text-transform: uppercase;"><th colspan="' + colSpanHeader + '" style="border: 1px solid #c0c0c0; padding: 5px 8px;">' + tituloSecao + '</th></tr>';
-    html += '<tr style="background-color: #000000; color: #ffffff; font-weight: bold; text-align: center; font-size: 12px; text-transform: uppercase;">';
-    html += '<th style="border: 1px solid #c0c0c0; padding: 4px 6px; width: 22%;">NAVIO</th>';
-    html += '<th style="border: 1px solid #c0c0c0; padding: 4px 6px; width: 12%;">' + (ehAtracado? 'ATRACAÇÃO' : 'CHEGADA') + '</th>';
-    if (ehAtracado) html += '<th style="border: 1px solid #c0c0c0; padding: 4px 6px; width: 8%;">BERÇO</th>';
-    html += '<th style="border: 1px solid #c0c0c0; padding: 4px 6px; width: 46%;">ORIGEM/CARGA</th>';
-    html += '<th style="border: 1px solid #c0c0c0; padding: 4px 6px; width: 12%;">' + (ehAtracado? 'REALIZADO' : 'PREVISTO') + '</th></tr>';
+    html += `<tr style="background:#808080;color:#fff;font-weight:bold;text-align:center;font-size:14px;text-transform:uppercase;"><th colspan="${colSpanHeader}" style="border:1px solid #c0c0c0;padding:5px 8px;">${tituloSecao}</th></tr>`;
+    html += `<tr style="background:#000;color:#fff;font-weight:bold;text-align:center;font-size:12px;text-transform:uppercase;">`;
+    html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:22%;">NAVIO</th>`;
+    html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:12%;">${ehAtracado? 'ATRACAÇÃO' : 'CHEGADA'}</th>`;
+    if (ehAtracado) html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:8%;">BERÇO</th>`;
+    html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:46%;">ORIGEM/CARGA</th>`;
+    html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:12%;">${ehAtracado? 'REALIZADO' : 'PREVISTO'}</th></tr>`;
 
     for (let r of listaNavios) {
-      // CORRIGIDO: grifa a palavra inteira que está em carga_completa
       let origemCarga = r.origem_porto;
       if (r.carga_completa) {
-        origemCarga += ' <b style="color:#0066cc;">' + r.carga_completa + '</b>';
+        origemCarga += ` <b style="color:#0066cc;">${r.carga_completa}</b>`;
       }
 
-      html += '<tr style="background-color: #ffffff; text-align: center; color: #000000; font-size: 12px; line-height: 1.3;">';
-      html += '<td style="padding: 4px 6px; border: 1px solid #c0c0c0; font-weight: bold; text-transform: uppercase;">' + r.navio + '</td>';
-      html += '<td style="padding: 4px 6px; border: 1px solid #c0c0c0;">' + r.chegada + '</td>';
-      if (ehAtracado) html += '<td style="padding: 4px 6px; border: 1px solid #c0c0c0;">' + r.berco + '</td>';
-      html += '<td style="padding: 4px 6px; border: 1px solid #c0c0c0;">' + origemCarga + '</td>';
-      html += '<td style="padding: 4px 6px; border: 1px solid #c0c0c0; font-weight: bold;">' + r.previsto + '</td></tr>';
+      html += `<tr style="background:#fff;text-align:center;color:#000;font-size:12px;line-height:1.3;">`;
+      html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;font-weight:bold;text-transform:uppercase;">${r.navio}</td>`;
+      html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;">${r.chegada}</td>`;
+      if (ehAtracado) html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;">${r.berco}</td>`;
+      html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;">${origemCarga}</td>`;
+      html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;font-weight:bold;">${r.previsto}</td></tr>`;
     }
     html += '</table>';
     return html;
@@ -314,41 +265,44 @@ function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
   corpoHtml += gerarBlocoTabela("NAVIO ATRACADOS", atracados, true);
 
   if (tabela.length === 0 && temCarga) {
-     corpoHtml += '<p style="margin: 8px 0 0 0; font-size: 12px;">Cargas detectadas mas não foi possível extrair detalhes dos navios.</p>';
+    corpoHtml += '<p style="margin:8px 0 0 0;font-size:12px;">Cargas detectadas mas não foi possível extrair detalhes dos navios.</p>';
   }
-  corpoHtml += '<p style="margin: 8px 0 0 0; font-size: 12px;">O PDF original lido segue anexado a este e-mail.</p>';
+  corpoHtml += '<p style="margin:8px 0 0 0;font-size:12px;">O PDF original segue anexado.</p>';
 
-  // MODO TESTE ATIVO: só loga, não envia
-  // Logger.log("MODO TESTE - E-mail não enviado");
-  // Logger.log("Assunto: " + assunto);
-  // Logger.log("Total destinatários BCC: " + listaEmails.length);
-  // Logger.log("Destinatários: " + listaEmails.join(", "));
-
-  // PRA ENVIAR DE VERDADE AMANHÃ, DESCOMENTA O BLOCO ABAIXO:
+  // MODO TESTE: descomenta pra enviar de verdade
   MailApp.sendEmail({
-  to: Session.getActiveUser().getEmail(),
-  bcc: listaEmails.join(','),
-  subject: assunto,
-  htmlBody: corpoHtml,
-  attachments: [pdfBlob],
-  name: 'RDO Porto Imbituba'
+    to: Session.getActiveUser().getEmail(),
+    bcc: listaEmails.join(','),
+    subject: assunto,
+    htmlBody: corpoHtml,
+    attachments: [pdfBlob],
+    name: `RDO ${CONFIG.NOME_PORTO}`
   });
-  Logger.log("E-mail enviado via BCC para " + listaEmails.length + " destinatários");
+  Logger.log(`E-mail enviado para ${listaEmails.length} destinatários`);
+}
+
+function notificarErro(erro) {
+  try {
+    MailApp.sendEmail({
+      to: Session.getActiveUser().getEmail(),
+      subject: `ERRO RDO Automático - ${CONFIG.NOME_PORTO}`,
+      body: `Falha ao executar:\n\n${erro.message}\n\n${erro.stack}`
+    });
+  } catch(e) {
+    Logger.log("Falha ao enviar email de erro: " + e.message);
+  }
 }
 
 function limparPastaRDO() {
   try {
-    const PASTA_PDF_ID = "1CNBjzkej2honYt-RXoJbLp8ZtKdBLWqs";
-    const pasta = DriveApp.getFolderById(PASTA_PDF_ID);
+    const pasta = DriveApp.getFolderById(CONFIG.PASTA_PDF_ID);
     const arquivos = pasta.getFiles();
     let contador = 0;
-
     while (arquivos.hasNext()) {
       arquivos.next().setTrashed(true);
       contador++;
     }
-
-    Logger.log("Pasta limpa. Total de arquivos movidos pra lixeira: " + contador);
+    Logger.log(`Pasta limpa. ${contador} arquivos movidos pra lixeira.`);
   } catch (erro) {
     Logger.log("Erro ao limpar pasta: " + erro.message);
     throw erro;
