@@ -139,7 +139,7 @@ function escapeRegex(string) {
 
 /**
  * Lê aba 'cargas' da planilha e busca cada carga no texto do PDF.
- * Usa regex separado pra Esperado e Atracado conforme layout do RDO Imbituba.
+ * Usa regex separado pra Esperado/Fundeado e Atracado conforme layout do RDO Imbituba.
  * Retorna lista de cargas encontradas + tabela de navios formatada.
  */
 function processarRDO(textoPdf, idPlanilha) {
@@ -163,7 +163,8 @@ function processarRDO(textoPdf, idPlanilha) {
   let tabelaNavios = [];
 
   const secoes = [
-    { nome: "NAVIO ESPERADO", regex: /NAVIOS?\s+ESPERADOS?([\s\S]*?)(?=NAVIOS?\s+ATRACADOS?|NAVIOS?\s+SA[IÍ]DOS?|Emitido\s+em|$)/i },
+    { nome: "NAVIO ESPERADO", regex: /NAVIOS?\s+ESPERADOS?([\s\S]*?)(?=NAVIOS?\s+ATRACADOS?|NAVIOS?\s+FUNDEADOS?|NAVIOS?\s+SA[IÍ]DOS?|Emitido\s+em|$)/i },
+    { nome: "NAVIO FUNDEADO", regex: /NAVIOS?\s+FUNDEADOS?([\s\S]*?)(?=NAVIOS?\s+ATRACADOS?|NAVIOS?\s+SA[IÍ]DOS?|Emitido\s+em|$)/i },
     { nome: "NAVIO ATRACADO", regex: /NAVIOS?\s+ATRACADOS?([\s\S]*?)(?=NAVIOS?\s+SA[IÍ]DOS?|Emitido\s+em|$)/i }
   ];
 
@@ -173,11 +174,14 @@ function processarRDO(textoPdf, idPlanilha) {
 
     let textoSecao = matchSecao[1];
     textoSecao = textoSecao.replace(/NAVIO\s+VG\s+LOA[\s\S]*?PREVISTO/i, '').trim();
+    textoSecao = textoSecao.replace(/NAVIO\s+VG[\s\S]*?PREVISTO/i, '').trim();
 
     let regexNavio;
-    if (secao.nome === "NAVIO ESPERADO") {
+    if (secao.nome === "NAVIO ESPERADO" || secao.nome === "NAVIO FUNDEADO") {
+      // Esperado e Fundeado: NAVIO VG LOA DATA HORA BERCO ORIGEM...CARGA TONELAGEM
       regexNavio = /([A-Z][A-Z\s\.\-]+?)\s+(\d+)\s+([\d,]+)\s+(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}\s+(\d{4})\s+(.+?)\s+([\d\.,]+)(?=\s+[A-Z][A-Z\s\.\-]+?\s+\d+|$)/g;
     } else {
+      // Atracado: NAVIO VG LOA DATA HORA BERCO ORIGEM...CARGA DATA HORA TONELAGEM REALIZADO
       regexNavio = /([A-Z][A-Z\s\.\-]+?)\s+(\d+)\s+([\d,]+)\s+(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}\s+(\d{4})\s+(.+?)\s+\d{2}\/\d{2}\s+\d{2}:\d{2}\s+([\d\.,]+)\s+[\d\.,]+(?=\s+[A-Z][A-Z\s\.\-]+?\s+\d+|$)/g;
     }
 
@@ -188,7 +192,7 @@ function processarRDO(textoPdf, idPlanilha) {
       let data = match[4];
       let berco = secao.nome === "NAVIO ATRACADO"? match[5] : "N/A";
       let miolo = match[6].trim();
-      let tonelagem = secao.nome === "NAVIO ESPERADO"? match[7] : match[7];
+      let tonelagem = match[7];
 
       const cargaInfo = detectarCarga(miolo, cargasOrdenadas);
       if (!cargaInfo) continue;
@@ -295,9 +299,9 @@ function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
     dados.tabela.forEach(nav => {
       if (nav.carga_completa) {
         let cargaLimpa = nav.carga_completa
-        .replace(/\s+(GPC|TEG|TECON|ILP|BRASI|CRISTAL)$/i, '')
-        .replace(/\s+/g, ' ')
-        .trim();
+       .replace(/\s+(GPC|TEG|TECON|ILP|BRASI|CRISTAL)$/i, '')
+       .replace(/\s+/g, ' ')
+       .trim();
         
         let chave = cargaLimpa.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
         
@@ -330,6 +334,7 @@ function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
 
   let tabela = dados.tabela || [];
   let esperados = tabela.filter(r => r.status === "NAVIO ESPERADO");
+  let fundeados = tabela.filter(r => r.status === "NAVIO FUNDEADO"); // CORRIGIDO: linha que faltava
   let atracados = tabela.filter(r => r.status === "NAVIO ATRACADO");
 
   let corpoHtml = `<h3 style="margin:0 0 8px 0;font-size:16px;">Relatório de Navios - ${CONFIG.NOME_PORTO} (${dataHojeBR})</h3>`;
@@ -370,6 +375,7 @@ function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
   }
 
   corpoHtml += gerarBlocoTabela("NAVIOS ESPERADOS", esperados, false);
+  corpoHtml += gerarBlocoTabela("NAVIOS FUNDEADOS", fundeados, false);
   corpoHtml += gerarBlocoTabela("NAVIOS ATRACADOS", atracados, true);
 
   if (tabela.length === 0 && temCarga) {
