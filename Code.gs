@@ -43,16 +43,21 @@ const CONFIG = {
  * FUNÇÃO PRINCIPAL - EXECUTAR DIARIAMENTE VIA GATILHO
  * Baixa PDF, extrai texto, processa cargas, envia email e limpa arquivos temp
  */
+
 function executarRDOAutomatico() {
   let arquivoPdf = null;
   let tempFileId = null;
   let docFileId = null;
 
   try {
+// Para rodar tambem aos finais de semana desmarcar esta parte 
+    const diaSemana = new Date().getDay();
+    if (diaSemana === 0 || diaSemana === 6) {
+      Logger.log('Hoje é fim de semana. Não vou enviar.');
+      return;
+    }
     Logger.log(`RDO Automático v${VERSION} iniciado - Porto ${CONFIG.NOME_PORTO}`);
     validarConfig();
-
-    // Evita bloqueio do Google por excesso de requisições
     Utilities.sleep(1000);
 
     const pdfResponse = UrlFetchApp.fetch(CONFIG.URL_PDF, { muteHttpExceptions: true });
@@ -93,9 +98,6 @@ function executarRDOAutomatico() {
   }
 }
 
-/**
- * Valida se o usuário preencheu a CONFIG. Trava execução se esqueceu.
- */
 function validarConfig() {
   if (CONFIG.ID_PLANILHA.includes("COLE_AQUI") || CONFIG.PASTA_PDF_ID.includes("COLE_AQUI")) {
     throw new Error("CONFIG não preenchida. Edite o objeto CONFIG no topo do código com os IDs reais da planilha e pasta.");
@@ -105,10 +107,6 @@ function validarConfig() {
   }
 }
 
-/**
- * Converte PDF em texto usando OCR do Google Docs.
- * IMPORTANTE: Drive API v3 precisa estar ativada em Serviços Avançados.
- */
 function extrairTextoDoPDF(pdfBlob) {
   const tempFile = DriveApp.createFile(pdfBlob);
   const tempFileId = tempFile.getId();
@@ -130,18 +128,20 @@ function extrairTextoDoPDF(pdfBlob) {
   }
 }
 
-/**
- * Escapa caracteres especiais pra usar em regex.
- */
+function normalizarLOA(loa) {
+  if (!loa) return "000";
+  let loaStr = loa.toString().trim().toUpperCase();
+  if (loaStr === "" || loaStr === "VAZIO" || loaStr === "-" || loaStr === "N/A") {
+    return "000";
+  }
+  let loaNum = loaStr.replace(/[^\d,\.]/g, '');
+  return loaNum || "000";
+}
+
 function escapeRegex(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/**
- * Lê aba 'cargas' da planilha e busca cada carga no texto do PDF.
- * Usa regex separado pra Esperado/Fundeado e Atracado conforme layout do RDO Imbituba.
- * Retorna lista de cargas encontradas + tabela de navios formatada.
- */
 function processarRDO(textoPdf, idPlanilha) {
   const planilha = SpreadsheetApp.openById(idPlanilha);
   const abaCargas = planilha.getSheetByName("cargas");
@@ -177,22 +177,28 @@ function processarRDO(textoPdf, idPlanilha) {
     textoSecao = textoSecao.replace(/NAVIO\s+VG[\s\S]*?PREVISTO/i, '').trim();
 
     let regexNavio;
-    if (secao.nome === "NAVIO ESPERADO" || secao.nome === "NAVIO FUNDEADO") {
-      // Esperado e Fundeado: NAVIO VG LOA DATA HORA BERCO ORIGEM...CARGA TONELAGEM
-      regexNavio = /([A-Z][A-Z\s\.\-]+?)\s+(\d+)\s+([\d,]+)\s+(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}\s+(\d{4})\s+(.+?)\s+([\d\.,]+)(?=\s+[A-Z][A-Z\s\.\-]+?\s+\d+|$)/g;
+    if (secao.nome === "NAVIO ATRACADO") {
+      // ATRACADO: NAVIO VG LOA ATRACACAO HORA BERCO... CARGA PREV.SAIDA REALIZADO PREVISTO
+      // Pega REALIZADO = match[8], PREVISTO = match[9]
+      regexNavio = /([A-Z][A-Z\s\.\-]+?)\s+(\d+)\s+(?:([\d,\.\-VAZIO]+)\s+)?(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}\s+(\d{4})\s+(.+?)\s+\d{2}\/\d{2}\s+\d{2}:\d{2}\s+([\d\.,]+)\s+([\d\.,]+)(?=\s+[A-Z][A-Z\s\.\-]+?\s+\d*|$)/g;
     } else {
-      // Atracado: NAVIO VG LOA DATA HORA BERCO ORIGEM...CARGA DATA HORA TONELAGEM REALIZADO
-      regexNavio = /([A-Z][A-Z\s\.\-]+?)\s+(\d+)\s+([\d,]+)\s+(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}\s+(\d{4})\s+(.+?)\s+\d{2}\/\d{2}\s+\d{2}:\d{2}\s+([\d\.,]+)\s+[\d\.,]+(?=\s+[A-Z][A-Z\s\.\-]+?\s+\d+|$)/g;
+      // ESPERADO/FUNDEADO: NAVIO VG LOA CHEGADA HORA BERCO... PREVISTO
+      regexNavio = /([A-Z][A-Z\s\.\-]+?)\s+(\d+)\s+(?:([\d,\.\-VAZIO]+)\s+)?(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}\s+(\d{4})\s+(.+?)\s+([\d\.,]+)(?=\s+[A-Z][A-Z\s\.\-]+?\s+\d*|$)/g;
     }
 
     var matches = [...textoSecao.matchAll(regexNavio)];
 
     for (let match of matches) {
       let nomeNavio = match[1].replace(/\s+\d+$/, '').trim();
+      let vg = match[2] || "01";
+      let loa = normalizarLOA(match[3]);
       let data = match[4];
-      let berco = secao.nome === "NAVIO ATRACADO"? match[5] : "N/A";
+      let berco = match[5];
       let miolo = match[6].trim();
-      let tonelagem = match[7];
+
+      // Se ATRACADO: REALIZADO=match[7], PREVISTO=match[8]. Usa REALIZADO.
+      // Se ESPERADO/FUNDEADO: PREVISTO=match[7]
+      let tonelagem = secao.nome === "NAVIO ATRACADO"? match[7] : match[7];
 
       const cargaInfo = detectarCarga(miolo, cargasOrdenadas);
       if (!cargaInfo) continue;
@@ -202,6 +208,7 @@ function processarRDO(textoPdf, idPlanilha) {
       tabelaNavios.push({
         status: secao.nome,
         navio: nomeNavio,
+        loa: loa,
         chegada: data,
         berco: berco,
         origem_porto: cargaInfo.origem,
@@ -209,7 +216,9 @@ function processarRDO(textoPdf, idPlanilha) {
         previsto: tonelagem,
         carga_detectada: cargaInfo.carga
       });
+      Logger.log(`ACHOU: ${nomeNavio} LOA:${loa} - ${cargaInfo.carga} - ${tonelagem}`);
     }
+
   }
 
   Logger.log("CARGAS ENCONTRADAS: " + cargasEncontradas.join(", "));
@@ -222,11 +231,6 @@ function processarRDO(textoPdf, idPlanilha) {
   };
 }
 
-/**
- * Detecta qual carga da lista está no texto do navio.
- * Pega a carga completa até a tonelagem, sem cortar.
- * Ex: Se na planilha tá "Coque", retorna "Coque Não Calcinado" inteiro do PDF
- */
 function detectarCarga(textoMiolo, cargasOrdenadas) {
   const muros = ['IMBITUB','IMBIT','TCG','GRANÉIS','GRANEIS','ILP','BRASI','CRISTAL','TEG','TECON','GPC'];
   let partesMiolo = textoMiolo.split(/\s+/);
@@ -242,6 +246,8 @@ function detectarCarga(textoMiolo, cargasOrdenadas) {
   if (idxMuro === -1) return null;
 
   let depoisMuro = partesMiolo.slice(idxMuro + 1).join(" ");
+  // Remove data/hora que pode vir grudada: "Sal 20/06 01:00"
+  depoisMuro = depoisMuro.replace(/\s*\d{2}\/\d{2}\s+\d{2}:\d{2}.*/, '').trim();
   let depoisMuroNormalizado = depoisMuro.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
 
   for (let carga of cargasOrdenadas) {
@@ -253,6 +259,8 @@ function detectarCarga(textoMiolo, cargasOrdenadas) {
       idxInicioPalavra = idxInicioPalavra === -1? 0 : idxInicioPalavra + 1;
 
       let cargaCompletaOriginal = depoisMuro.substring(idxInicioPalavra).trim();
+      // Remove data e números no final
+      cargaCompletaOriginal = cargaCompletaOriginal.replace(/\s+\d{2}\/\d{2}\s+\d{2}:\d{2}.*/, '');
       cargaCompletaOriginal = cargaCompletaOriginal.replace(/\s+[\d\.,]+$/, '').trim();
 
       return {
@@ -266,11 +274,6 @@ function detectarCarga(textoMiolo, cargasOrdenadas) {
   return null;
 }
 
-/**
- * Monta HTML do email e dispara pra lista da aba 'email' coluna B.
- * Usa nome real da carga achada no PDF, não da planilha.
- * Agrupa cargas similares pra evitar duplicata no cabeçalho.
- */
 function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
   const planilha = SpreadsheetApp.openById(idPlanilha);
   const abaEmails = planilha.getSheetByName("email");
@@ -291,24 +294,24 @@ function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
   }
 
   const temCarga = dados && dados.status === "sucesso" && dados.tabela.length > 0;
-  
+
   let cargasReais = [];
   if (temCarga) {
     let cargasMap = new Map();
-    
+
     dados.tabela.forEach(nav => {
       if (nav.carga_completa) {
         let cargaLimpa = nav.carga_completa
-       .replace(/\s+(GPC|TEG|TECON|ILP|BRASI|CRISTAL)$/i, '')
-       .replace(/\s+/g, ' ')
-       .trim();
-        
+      .replace(/\s+(GPC|TEG|TECON|ILP|BRASI|CRISTAL)$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
         let chave = cargaLimpa.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-        
+
         if (!cargasMap.has(chave) || cargaLimpa.length > cargasMap.get(chave).length) {
           cargasMap.set(chave, cargaLimpa);
         }
-        
+
         for (let [k, v] of cargasMap.entries()) {
           if (chave.includes(k) && chave!== k) {
             cargasMap.delete(k);
@@ -319,7 +322,7 @@ function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
         }
       }
     });
-    
+
     cargasReais = [...cargasMap.values()];
   }
 
@@ -334,7 +337,7 @@ function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
 
   let tabela = dados.tabela || [];
   let esperados = tabela.filter(r => r.status === "NAVIO ESPERADO");
-  let fundeados = tabela.filter(r => r.status === "NAVIO FUNDEADO"); // CORRIGIDO: linha que faltava
+  let fundeados = tabela.filter(r => r.status === "NAVIO FUNDEADO");
   let atracados = tabela.filter(r => r.status === "NAVIO ATRACADO");
 
   let corpoHtml = `<h3 style="margin:0 0 8px 0;font-size:16px;">Relatório de Navios - ${CONFIG.NOME_PORTO} (${dataHojeBR})</h3>`;
@@ -345,34 +348,42 @@ function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
     corpoHtml += `<p style="margin:0 0 8px 0;font-size:13px;"><b>Cargas detectadas:</b> ${listaCargasAchadas}</p>`;
   }
 
-  function gerarBlocoTabela(tituloSecao, listaNavios, ehAtracado) {
-    if (listaNavios.length === 0) return '';
-    let html = `<table style="width:100%;max-width:900px;border-collapse:collapse;border:1px solid #c0c0c0;font-family:Calibri,Arial,sans-serif;margin-bottom:12px;font-size:12px;">`;
-    let colSpanHeader = ehAtracado? "5" : "4";
-    html += `<tr style="background:#808080;color:#fff;font-weight:bold;text-align:center;font-size:14px;text-transform:uppercase;"><th colspan="${colSpanHeader}" style="border:1px solid #c0c0c0;padding:5px 8px;">${tituloSecao}</th></tr>`;
-    html += `<tr style="background:#000;color:#fff;font-weight:bold;text-align:center;font-size:12px;text-transform:uppercase;">`;
-    html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:22%;">NAVIO</th>`;
-    html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:12%;">${ehAtracado? 'ATRACAÇÃO' : 'CHEGADA'}</th>`;
-    if (ehAtracado) html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:8%;">BERÇO</th>`;
-    html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:46%;">ORIGEM/CARGA</th>`;
-    html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:12%;">${ehAtracado? 'REALIZADO' : 'PREVISTO'}</th></tr>`;
+function gerarBlocoTabela(tituloSecao, listaNavios, ehAtracado) {
+  if (listaNavios.length === 0) return '';
+  let html = `<table style="width:100%;max-width:900px;border-collapse:collapse;border:1px solid #c0c0c0;font-family:Calibri,Arial,sans-serif;margin-bottom:12px;font-size:12px;">`;
+  let colSpanHeader = ehAtracado? "5" : "4";
+  html += `<tr style="background:#808080;color:#fff;font-weight:bold;text-align:center;font-size:14px;text-transform:uppercase;"><th colspan="${colSpanHeader}" style="border:1px solid #c0c0c0;padding:5px 8px;">${tituloSecao}</th></tr>`;
+  html += `<tr style="background:#000;color:#fff;font-weight:bold;text-align:center;font-size:12px;text-transform:uppercase;">`;
+  html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:22%;">NAVIO</th>`;
+  html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:12%;">${ehAtracado? 'ATRACAÇÃO' : 'CHEGADA'}</th>`;
+  if (ehAtracado) html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:8%;">BERÇO</th>`;
+  html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:46%;">ORIGEM/CARGA</th>`;
+  html += `<th style="border:1px solid #c0c0c0;padding:4px 6px;width:12%;">${ehAtracado? 'REALIZADO' : 'PREVISTO'}</th></tr>`;
 
-    for (let r of listaNavios) {
-      let origemCarga = r.origem_porto;
+  for (let r of listaNavios) {
+    let origemCarga;
+
+    if (ehAtracado) {
+      origemCarga = r.carga_completa
+       ? `<b style="color:#0066cc;">${r.carga_completa.replace(/\s+\d{2}\/\d{2}\s+\d{2}:\d{2}.*/, '')}</b>`
+        : "";
+    } else {
+      origemCarga = r.origem_porto;
       if (r.carga_completa) {
         origemCarga += ` <b style="color:#0066cc;">${r.carga_completa}</b>`;
       }
-
-      html += `<tr style="background:#fff;text-align:center;color:#000;font-size:12px;line-height:1.3;">`;
-      html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;font-weight:bold;text-transform:uppercase;white-space:nowrap;">${r.navio}</td>`;
-      html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;">${r.chegada}</td>`;
-      if (ehAtracado) html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;">${r.berco}</td>`;
-      html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;">${origemCarga}</td>`;
-      html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;font-weight:bold;">${r.previsto}</td></tr>`;
     }
-    html += '</table>';
-    return html;
+
+    html += `<tr style="background:#fff;text-align:center;color:#000;font-size:12px;line-height:1.3;">`;
+    html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;font-weight:bold;text-transform:uppercase;white-space:nowrap;">${r.navio}</td>`;
+    html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;">${r.chegada}</td>`;
+    if (ehAtracado) html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;">${r.berco}</td>`;
+    html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;">${origemCarga}</td>`;
+    html += `<td style="padding:4px 6px;border:1px solid #c0c0c0;font-weight:bold;">${r.previsto}</td></tr>`;
   }
+  html += '</table>';
+  return html;
+}
 
   corpoHtml += gerarBlocoTabela("NAVIOS ESPERADOS", esperados, false);
   corpoHtml += gerarBlocoTabela("NAVIOS FUNDEADOS", fundeados, false);
@@ -395,9 +406,6 @@ function enviarEmailRDO(dados, pdfBlob, idPlanilha, dataHojeBR) {
   Logger.log(`E-mail enviado para ${listaEmails.length} destinatários`);
 }
 
-/**
- * Se der erro, manda email só pra você com o stack trace completo.
- */
 function notificarErro(erro) {
   try {
     MailApp.sendEmail({
@@ -410,10 +418,6 @@ function notificarErro(erro) {
   }
 }
 
-/**
- * FUNÇÃO AUXILIAR: Limpa pasta de PDFs manualmente se precisar.
- * Execute 1x por semana se a pasta lotar.
- */
 function limparPastaRDO() {
   try {
     const pasta = DriveApp.getFolderById(CONFIG.PASTA_PDF_ID);
